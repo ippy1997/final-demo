@@ -44,6 +44,20 @@ was returned, rather than by rebuilding a path from the id.
   paste is alive, and the paste's own link still resolves — a wrong id never
   reaches the stored text, whichever side of the deadline it is asked on
   (PRD.md item 3).
+- tc007: the instant the create response reported as ``expires_at`` is the
+  instant the returned link obeys: served one second before it, the uniform 404
+  from it on (PRD.md item 4; that the reported deadline is the enforced one is
+  not decided by any other case, which compare against the constant instead).
+- tc008: the same link opened the way PRD.md's paste reader opens it — with a
+  browser's headers — still comes back as ``text/plain`` with the exact bytes
+  and nothing that would make a browser download it (PRD.md item 2 and Users).
+- tc009: that browser-style request past the deadline is the very same 404 an
+  unknown id gets, so the reader with no tooling beyond a browser learns
+  nothing either (PRD.md item 5 and Users).
+- tc010: the largest paste the service accepts — a body of exactly
+  ``config.MAX_PASTE_BYTES`` — round-trips byte-for-byte through its returned
+  link and dies at its own deadline like any other (PRD.md item 2 and item 7's
+  ceiling, walked through the journey).
 
 The clock is the fixture's ``FakeClock``, assigned between two requests
 (``tests/conftest.py``), so the expiry is observed without sleeping and without
@@ -56,6 +70,7 @@ item 12.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -96,6 +111,20 @@ MALFORMED_IDS = [
 # never existed" if the 404 carried one (PRD.md item 5).
 HINT_HEADERS = ("retry-after", "www-authenticate", "location")
 
+# What a browser sends when a person follows the link, which is how PRD.md's
+# paste reader arrives: an HTML-preferring navigation with no API client behind
+# it. The service has to answer with plain text anyway (PRD.md item 2 and
+# Users), and with the same 404 once the paste is gone (PRD.md item 5).
+BROWSER_HEADERS = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-encoding": "gzip, deflate, br",
+    "accept-language": "en-GB,en;q=0.9",
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "cross-site",
+    "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+}
+
 # The text the whole journey is walked with: PRD.md item 2's shapes — newlines,
 # leading and trailing whitespace, non-ASCII characters and emoji — so an answer
 # that trimmed, re-encoded or rendered the paste could not come back byte for
@@ -120,6 +149,12 @@ VERBATIM_BODIES = [
     "\ufeffa byte order mark\x00and a NUL byte",
 ]
 
+# The largest body the service accepts, bracketed by a first and a last line so
+# a paste that came back truncated or padded anywhere would not compare equal
+# (PRD.md item 2 at PRD.md item 7's ceiling).
+CEILING_HEAD = "first line of the largest allowed paste\n"
+CEILING_TAIL = "\nlast line of the largest allowed paste\n"
+
 
 class _ForbiddenClock:
     """Stands in for the ``time`` module and refuses to report an instant.
@@ -132,6 +167,21 @@ class _ForbiddenClock:
 
     def time(self) -> float:
         raise AssertionError("the real clock was read while a fake one was set")
+
+
+def _ceiling_text() -> str:
+    """A text whose UTF-8 encoding is exactly ``config.MAX_PASTE_BYTES`` bytes.
+
+    Every character here is ASCII, so the byte length is the character count and
+    the head and the tail sit at the two ends of the ceiling (PRD.md item 7's
+    boundary, which PRD.md item 2's round trip has to hold at too).
+    """
+    filler = (
+        config.MAX_PASTE_BYTES
+        - len(CEILING_HEAD.encode("utf-8"))
+        - len(CEILING_TAIL.encode("utf-8"))
+    )
+    return CEILING_HEAD + "x" * filler + CEILING_TAIL
 
 
 def _stored_rows(db_path: Path) -> list[tuple[str, str, float, float]]:
@@ -328,3 +378,98 @@ def test_tc006_a_wrong_id_is_already_the_uniform_404_while_the_paste_lives(
     still_there = client.get(paste["url"])
     assert still_there.status_code == 200
     assert still_there.content == JOURNEY_TEXT.encode("utf-8")
+
+
+def test_tc007_the_reported_deadline_is_the_instant_the_link_stops_working(
+    client: TestClient, fake_clock: FakeClock
+) -> None:
+    """PRD.md item 4: the instant the creator is told is the instant enforced."""
+    paste = _created_paste(client, fake_clock)
+
+    # The deadline travels back as an absolute UTC instant, and it is the
+    # creation instant plus the fixed three hours (PRD.md item 4).
+    reported = datetime.fromisoformat(paste["expires_at"])
+    assert reported.utcoffset() == timedelta(0)
+    assert reported.timestamp() == DEADLINE
+
+    # One second before the instant the response named, the link still serves
+    # the text; at that instant it is gone, with no grace period (the strict
+    # boundary PRD.md's defaults fix).
+    fake_clock.instant = reported.timestamp() - 1
+    alive = client.get(paste["url"])
+    assert alive.status_code == 200
+    assert alive.headers["content-type"] == TEXT_PLAIN_CONTENT_TYPE
+    assert alive.content == JOURNEY_TEXT.encode("utf-8")
+
+    fake_clock.instant = reported.timestamp()
+    expired = client.get(paste["url"])
+    unknown = client.get(f"{PASTES_PATH}/{UNKNOWN_ID}")
+
+    assert expired.status_code == 404
+    assert expired.content == NOT_FOUND_BODY
+    assert expired.json() == {"error": NOT_FOUND_CODE}
+    assert expired.content == unknown.content
+    assert dict(expired.headers) == dict(unknown.headers)
+
+
+def test_tc008_a_browser_reader_sees_the_text_as_plain_text_byte_for_byte(
+    client: TestClient, fake_clock: FakeClock
+) -> None:
+    """PRD.md item 2 and Users: a browser displays the text, it does not download it."""
+    paste = _created_paste(client, fake_clock)
+
+    served = client.get(paste["url"], headers=BROWSER_HEADERS)
+
+    assert served.status_code == 200
+    assert served.headers["content-type"] == TEXT_PLAIN_CONTENT_TYPE
+    assert "content-disposition" not in served.headers
+    assert served.content == JOURNEY_TEXT.encode("utf-8")
+
+
+def test_tc009_a_browser_reader_past_the_deadline_gets_the_same_404(
+    client: TestClient, fake_clock: FakeClock
+) -> None:
+    """PRD.md item 5 and Users: the reader is told nothing about a dead paste."""
+    paste = _created_paste(client, fake_clock)
+
+    fake_clock.instant = DEADLINE
+    browser = client.get(paste["url"], headers=BROWSER_HEADERS)
+    unknown = client.get(f"{PASTES_PATH}/{UNKNOWN_ID}")
+
+    assert browser.status_code == 404
+    assert browser.content == NOT_FOUND_BODY
+    assert browser.json() == {"error": NOT_FOUND_CODE}
+    assert browser.content == unknown.content
+    assert dict(browser.headers) == dict(unknown.headers)
+    assert JOURNEY_TEXT.encode("utf-8") not in browser.content
+    for header in HINT_HEADERS:
+        assert header not in browser.headers, header
+
+
+def test_tc010_a_paste_at_the_size_ceiling_round_trips_and_dies_at_its_deadline(
+    client: TestClient, db_path: Path, fake_clock: FakeClock
+) -> None:
+    """PRD.md item 2 at its largest input: exactly 1 MiB, byte for byte, then 404."""
+    text = _ceiling_text()
+    assert len(text.encode("utf-8")) == config.MAX_PASTE_BYTES
+
+    paste = _created_paste(client, fake_clock, text)
+
+    served = client.get(paste["url"])
+
+    assert served.status_code == 200
+    assert served.headers["content-type"] == TEXT_PLAIN_CONTENT_TYPE
+    assert len(served.content) == config.MAX_PASTE_BYTES
+    assert served.content == text.encode("utf-8")
+    assert _stored_text_bytes(db_path) == config.MAX_PASTE_BYTES
+
+    fake_clock.instant = DEADLINE
+    expired = client.get(paste["url"])
+    unknown = client.get(f"{PASTES_PATH}/{UNKNOWN_ID}")
+
+    assert expired.status_code == 404
+    assert expired.content == NOT_FOUND_BODY
+    assert expired.content == unknown.content
+    assert dict(expired.headers) == dict(unknown.headers)
+    assert _stored_rows(db_path) == []
+    assert _stored_text_bytes(db_path) == 0

@@ -1,9 +1,9 @@
-"""Fixtures shared by the suite: a throwaway database, a fake clock and a test
-client (AGENTS.md Layout).
+"""Fixtures shared by the suite: a throwaway database, a fake clock, the
+sweeper's period and a test client (AGENTS.md Layout).
 
 The suite drives the real ``app.main:app`` through FastAPI's test client, so it
 exercises the same lifespan the documented start command runs — a test client
-entered with ``with``. Two things have to be true for that to be safe:
+entered with ``with``. Three things have to be true for that to be safe:
 
 - **A throwaway database.** ``PASTEBIN_DB`` is pointed at a file under
   ``tmp_path`` before the app is started, on every test, so no test can reach
@@ -15,7 +15,13 @@ entered with ``with``. Two things have to be true for that to be safe:
 - **A clock the test moves.** ``clock.now`` is the one override key
   (ARCHITECTURE.md Parts, table row "Clock"), so a fake clock installed here
   decides the instant every request sees: no test waits three hours and none
-  reads the machine's real clock (PRD.md Success).
+  reads the machine's real clock (PRD.md Success). The same fake clock is
+  installed as ``clock.now`` itself, because the lifespan's sweeper calls that
+  function directly rather than through a request dependency (TASKS.md item 9).
+- **A sweeper a test can watch.** The lifespan starts a task that sweeps every
+  ``config.SWEEP_INTERVAL_SECONDS``, a minute in production; ``sweep_interval``
+  is that period, defaulting to the documented constant and shortened by the
+  cases that have to see a sweep happen inside one test.
 
 ``FakeClock`` is mutable rather than fixed so one test can create a paste,
 move the instant past its deadline and read it again — the pattern the expiry
@@ -77,16 +83,55 @@ def fake_clock() -> FakeClock:
 
 
 @pytest.fixture
-def client(fake_clock: FakeClock, db_path: Path) -> Iterator[TestClient]:
+def sweep_interval(request: pytest.FixtureRequest) -> float:
+    """How often the app under test sweeps expired pastes, in seconds.
+
+    The default is the documented ``config.SWEEP_INTERVAL_SECONDS``: a minute,
+    longer than any test, so a case that has to watch a sweep happen has to ask
+    for one. It asks by parametrizing this fixture indirectly, as
+    ``tests/test_reclaim.py`` does::
+
+        @pytest.mark.parametrize("sweep_interval", [0.01], indirect=True)
+
+    ``client`` installs the value into ``config`` before the app is started,
+    because the lifespan's sweeper task reads that constant when it takes each
+    turn (``app.main._sweep_expired_pastes``). A case that leaves the value at
+    its default can be sure no sweep happened while it ran.
+    """
+    return getattr(request, "param", config.SWEEP_INTERVAL_SECONDS)
+
+
+@pytest.fixture
+def client(
+    fake_clock: FakeClock,
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sweep_interval: float,
+) -> Iterator[TestClient]:
     """The real app, on a throwaway database, served with the fake clock.
 
-    Entered as a context manager so the lifespan runs: the store is opened at
-    startup and closed at shutdown exactly as the run path does it (TASKS.md
-    item 9). The clock override is cleared afterwards so a fake instant cannot
-    leak into the next test (ARCHITECTURE.md's decision row on the injectable
-    clock).
+    Entered as a context manager so the lifespan runs: the store is opened and
+    the sweeper task started at startup, and both are stopped at shutdown
+    exactly as the run path does it (TASKS.md item 9). Three things are put in
+    place before the app starts:
+
+    - the fake clock as ``clock.now`` itself, because the sweeper calls that
+      function directly rather than through a request dependency: the same
+      instant decides a read's boundary and the sweeper's, and no background
+      task reaches the machine's clock (PRD.md Success);
+    - the same fake clock as the request dependency the routes take, which is
+      the override key ``clock.now`` (ARCHITECTURE.md's decision row);
+    - ``sweep_interval`` as ``config.SWEEP_INTERVAL_SECONDS``, so a case can
+      watch a sweep without waiting the documented minute.
+
+    The clock override is cleared afterwards so a fake instant cannot leak
+    into the next test; the two ``monkeypatch`` patches are undone with the
+    fixture, so ``config.SWEEP_INTERVAL_SECONDS`` is the documented constant
+    again for the next test (``tests/test_config.py`` asserts its value).
     """
     app.dependency_overrides[clock.now] = fake_clock.now
+    monkeypatch.setattr(clock, "now", fake_clock.now)
+    monkeypatch.setattr(config, "SWEEP_INTERVAL_SECONDS", sweep_interval)
     try:
         with TestClient(app) as test_client:
             yield test_client

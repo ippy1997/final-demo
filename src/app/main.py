@@ -1,10 +1,12 @@
 """FastAPI application entry point: the app, its routes, its errors and the
-lifespan that owns the store (ARCHITECTURE.md Parts, table row "HTTP app").
+lifespan that owns the store and the sweeper (ARCHITECTURE.md Parts, table row
+"HTTP app").
 
 TASKS.md builds this module in order: item 1 ships the app object and
 ``GET /health``, item 6 ships the create route below, item 7 adds the read
 route and the one uniform 404 handler, and item 9 adds the sweeper to the
-lifespan. What is here now is the skeleton plus the create and read journeys.
+lifespan. What is here now is the skeleton plus the create journey, the read
+journey and the sweeper that keeps the table from growing without bound.
 
 **Create.** ``POST /pastes`` takes the text as the raw request body, whatever
 its content type (ARCHITECTURE.md Create and its decision row "Create body is
@@ -26,6 +28,15 @@ verbatim round trip PRD.md item 2 asks for; from the deadline on the row is
 deleted before the answer is written — expired text is removed rather than
 filtered (PRD.md item 6) — and the request answers with the 404 below.
 
+**Sweep.** ``_sweep_expired_pastes`` is the one background task the process
+runs: every ``config.SWEEP_INTERVAL_SECONDS`` it hands the current instant from
+``clock.now()`` to ``store.delete_expired`` (ARCHITECTURE.md Sweep, TASKS.md
+item 9). Without it, a paste nobody reads again would hold its text for the
+life of the service, and PRD.md item 6 asks for the stored text to return to
+its earlier level once the deadlines pass rather than to be merely hidden from
+a reader. The lifespan starts the task at startup and cancels it before the
+store is closed, so it never uses a connection that has gone away.
+
 **The one 404.** ``_http_exception_handler`` is the single place the app
 answers a 404: the read route raises for an id that was never issued, raises
 again, after deleting the row, for a paste past its deadline, and the router
@@ -39,22 +50,31 @@ installs by default.
 The store is opened once by the lifespan, not per request: ``app.state.store``
 is what the routes use, and it is closed on shutdown so a restart reopens the
 same file with every unexpired paste in it (PRD.md item 8, ARCHITECTURE.md
-Journeys: Restart). The create route hands its insert to FastAPI's threadpool
-because that route reads its request body asynchronously, and the read route is
-a synchronous route, which FastAPI serves in the same threadpool: the store's
-one synchronous connection is therefore never used on the event loop that
-serves the next request (ARCHITECTURE.md Stack decision row).
+Journeys: Restart). ``app.state.sweeper`` is the task started with it, which is
+also how a test can see that the lifespan started one and stopped it. The
+create route hands its insert to FastAPI's threadpool because that route reads
+its request body asynchronously, and the read route is a synchronous route,
+which FastAPI serves in the same threadpool: the store's one synchronous
+connection is therefore never used on the event loop that serves the next
+request (ARCHITECTURE.md Stack decision row). The sweeper runs in that event
+loop and uses the same connection, which the store serialises with its own
+lock.
 
 Every error this module produces is JSON ``{"error": "<code>"}`` with a code
 ARCHITECTURE.md's error contract names — ``not_found``, ``too_large``,
 ``empty_body``, ``invalid_utf8`` — and a rejected request reaches the store
 nowhere: the create route checks the ceiling, the emptiness and the encoding
-before inserting (PRD.md item 7) and the read route only deletes.
+before inserting (PRD.md item 7) and the read route only deletes. The sweeper
+is the one failure that is not an answer to a caller: a sweep that raises is
+logged and the loop keeps going, because a database that was briefly locked
+must not stop reclamation for the life of the process.
 """
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import asyncio
+import logging
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from typing import AsyncIterator
 
@@ -66,6 +86,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import clock, config, ids
 from app.store import Store
+
+# Where a failed sweep is reported. The lifespan's task has no request to fail
+# and no caller to tell, so the log is the only place its trouble can surface.
+logger = logging.getLogger(__name__)
 
 # The two paths this module serves, in one place so the link the create
 # response returns is the path the read route answers on (ARCHITECTURE.md
@@ -86,9 +110,49 @@ NOT_FOUND_CODE = "not_found"
 TEXT_PLAIN_MEDIA_TYPE = "text/plain; charset=utf-8"
 
 
+async def _sweep_expired_pastes(app: FastAPI) -> None:
+    """Delete the expired pastes every ``config.SWEEP_INTERVAL_SECONDS``.
+
+    The lifespan's one background task (ARCHITECTURE.md Parts, table row "HTTP
+    app", and its Sweep journey): ``store.delete_expired`` is called with the
+    current instant until the task is cancelled at shutdown, so a paste that
+    nobody opens again still leaves the table and the stored text stays bounded
+    by the paste lifetime rather than growing with every paste ever made
+    (PRD.md item 6).
+
+    The instant comes from ``clock.now()``, the same function the routes take as
+    their dependency, so the process has one clock and the store reads none
+    (AGENTS.md Conventions). The period is read from the configuration at each
+    tick, so the documented constant is what decides it rather than a value
+    captured at startup, and the boundary it enforces is the read path's
+    boundary: a row goes from its deadline on, never a moment earlier.
+
+    The first tick happens one interval after startup rather than at startup,
+    so starting the service is not held up by a sweep; a paste whose deadline
+    fell while the process was down is collected by the first tick or by the
+    read that asks for it (ARCHITECTURE.md Journeys: Restart).
+
+    A sweep that fails is logged and forgotten, and the loop carries on: a
+    database that was briefly locked, or a file that went away, must not end
+    reclamation for the rest of the process's life. ``CancelledError`` is not
+    an ``Exception``, so the lifespan's shutdown still reaches this loop and
+    ends it.
+    """
+    store: Store = app.state.store
+
+    while True:
+        await asyncio.sleep(config.SWEEP_INTERVAL_SECONDS)
+        try:
+            store.delete_expired(clock.now())
+        except Exception:
+            logger.exception(
+                "the expired-paste sweep failed; the next tick will try again"
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Open the process's one store at startup and close it at shutdown.
+    """Open the process's one store, run the sweeper, and close both at shutdown.
 
     The path comes from ``config.database_path()`` — ``PASTEBIN_DB`` or the
     working-directory default — and is read here rather than at import, which
@@ -97,14 +161,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Success). Opening the store is also what creates the file, the table and
     the index if they are missing (TASKS.md item 5), so startup is the one
     place the app touches the filesystem.
+
+    The sweeper is started here and cancelled here, before the store is
+    closed: the lifespan owns the task, so there is no second way to start one
+    and no task outliving the connection it uses (ARCHITECTURE.md Sweep,
+    TASKS.md item 9).
     """
     store = Store(config.database_path())
     app.state.store = store
+    sweeper = asyncio.create_task(_sweep_expired_pastes(app))
+    app.state.sweeper = sweeper
     try:
         yield
     finally:
-        # Closing check-points the WAL back into the file, so the next process
-        # to open it sees every committed paste (PRD.md item 8).
+        # Cancelled and awaited before the store closes: the connection the
+        # sweeper uses is the one the shutdown check-points back into the file,
+        # so a task still running would query a closed database (PRD.md item 8).
+        sweeper.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweeper
         store.close()
 
 
@@ -284,7 +359,8 @@ def read_paste(paste_id: str, request: Request, now: clock.Now) -> Response:
     paste = store.get(paste_id)
 
     if paste is None:
-        # Never issued, or issued and already deleted: the same uniform 404.
+        # Never issued, or issued and already deleted — by this route earlier,
+        # or by the sweeper: the same uniform 404 either way (PRD.md item 5).
         raise StarletteHTTPException(
             status_code=NOT_FOUND_STATUS, detail=NOT_FOUND_CODE
         )

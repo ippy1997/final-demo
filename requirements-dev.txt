@@ -1,3 +1,10 @@
 -r requirements.txt
+
+# Editable install of the src/ layout: makes `app` importable as a top-level
+# package from the repository root, which is what lets the commands in
+# ARCHITECTURE.md Verification (`python -m uvicorn app.main:app`) and the test
+# suite work after `pip install -r requirements-dev.txt`.
+-e .
+
 pytest
 httpx

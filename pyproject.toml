@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# Repo root on sys.path, so `pytest` and `python -m pytest` both find the app
+# package from the repository root (ARCHITECTURE.md Verification).
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -35,11 +35,13 @@ Where the parts in ARCHITECTURE.md fit:
   point the store at a throwaway file and never reach the operator's database
   (PRD.md Success).
 - The one connection is used from more than one thread once the app runs:
-  every route is a synchronous function, so FastAPI serves them from its
-  threadpool, while the sweeper loops in the event loop. The connection is
-  therefore opened with ``check_same_thread=False`` and every method holds a
-  lock for the length of its statement, which is the serialisation
-  ARCHITECTURE.md's decision row names.
+  every call into the store goes through FastAPI's threadpool — a synchronous
+  route is served there, and the create route, which reads its request body
+  asynchronously, hands its insert to it — while the sweeper loops in the
+  event loop. The connection is therefore opened with
+  ``check_same_thread=False`` and every method holds a lock for the length of
+  its statement, which is the serialisation ARCHITECTURE.md's decision row
+  names.
 """
 
 from __future__ import annotations

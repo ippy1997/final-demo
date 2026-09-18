@@ -1,4 +1,4 @@
-"""The service starts and answers before any paste is created."""
+"""The service starts and answers before any paste exists (TASKS.md item 1)."""
 
 from fastapi.testclient import TestClient
 

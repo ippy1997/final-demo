@@ -7,9 +7,10 @@ name = "pastebin"
 version = "0.0.0"
 description = "A small HTTP service that turns a chunk of text into a link."
 requires-python = ">=3.11"
-# Runtime dependencies live in requirements.txt / requirements-dev.txt; this
-# metadata exists so the src/ layout can be installed, which is what makes the
-# `app` package importable from the repository root.
+# Runtime dependencies are installed from requirements.txt / requirements-dev.txt,
+# as ARCHITECTURE.md Verification says. This metadata exists only so the src/
+# layout can be installed, which is what makes `app` importable as a top-level
+# package from the repository root for `python -m uvicorn app.main:app`.
 dependencies = []
 
 [tool.setuptools]
@@ -19,8 +20,8 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.pytest.ini_options]
-# src/ on sys.path, so `pytest` and `python -m pytest` both find the app
-# package from the repository root without an install step (ARCHITECTURE.md
+# src/ on sys.path, so `pytest` and `python -m pytest` both find the app package
+# from the repository root without relying on the install (ARCHITECTURE.md
 # Verification).
 pythonpath = ["src"]
 testpaths = ["tests"]

@@ -1,10 +1,13 @@
+# Development dependencies: everything in requirements.txt plus the test suite.
 -r requirements.txt
 
 # Editable install of the src/ layout: makes `app` importable as a top-level
 # package from the repository root, which is what lets the commands in
-# ARCHITECTURE.md Verification (`python -m uvicorn app.main:app`) and the test
-# suite work after `pip install -r requirements-dev.txt`.
+# ARCHITECTURE.md Verification (`python -m uvicorn app.main:app`) work after
+# `pip install -r requirements-dev.txt`.
 -e .
 
+# Test runner, and the HTTP client FastAPI's TestClient uses (ARCHITECTURE.md
+# Verification: one command, no network, no running server).
 pytest
 httpx

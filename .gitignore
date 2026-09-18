@@ -30,7 +30,7 @@ env/
 # Local agent/sandbox environment
 .agentstudio/
 
-# SQLite store (runtime data, never committed; WAL sidecar files)
+# SQLite store (the operator's runtime data, never committed; WAL sidecars)
 *.db
 *.db-wal
 *.db-shm

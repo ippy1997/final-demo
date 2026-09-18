@@ -1,0 +1,17 @@
+# Tasks
+
+Build order for the first version. Each line is one focused change with its own tests; the requirement it serves is named in brackets. PRD.md is the agreed goal and is never edited; ARCHITECTURE.md holds the design these tasks implement.
+
+- [ ] 1. Project skeleton: `app/` package, `requirements.txt` (fastapi, uvicorn), `requirements-dev.txt` (pytest, httpx), `app/main.py` with the FastAPI app and `GET /health` returning 200, and `tests/test_health.py`. [Success: starts with one command as one process; Constraints: the test suite is part of the deliverable]
+- [ ] 2. `app/config.py`: `PASTE_TTL_SECONDS = 3 * 60 * 60`, `MAX_PASTE_BYTES = 1024 * 1024`, `SWEEP_INTERVAL_SECONDS`, and the database path from `PASTEBIN_DB` with a working-directory default; a test asserting the TTL is a constant with no override. [items 4, 7; Success: throwaway database, one-command start]
+- [ ] 3. `app/clock.py`: `now()` returning `time.time()`, exposed as the FastAPI dependency tests override. [item 4; Success: injectable time, no real clock in expiry tests]
+- [ ] 4. `app/ids.py`: `new_id()` from `secrets.token_urlsafe(16)`; tests for 22 characters, URL-safe alphabet, and 1000 back-to-back ids all distinct. [item 3]
+- [ ] 5. `app/store.py`: create the `pastes` table and the `expires_at` index at startup, with `insert`, `get`, `delete`, `delete_expired`, `count`, `text_bytes`, one WAL connection; tests against a temp file, including reopening it. [item 8; item 6]
+- [ ] 6. `POST /pastes`: read the raw body with the 1 MiB cap, 413 before storing when it is over, 400 with nothing stored when empty or not valid UTF-8, insert `created_at`/`expires_at`, answer 201 JSON `{id, url, expires_at}` with an absolute url built from the request. [items 1, 7]
+- [ ] 7. `GET /pastes/{paste_id}`: 200 `text/plain; charset=utf-8` with the stored text unchanged; one app-wide 404 handler giving the identical body and headers for a missing id, an expired paste (row deleted first) and an unmatched path. [items 2, 5]
+- [ ] 8. Expiry boundary tests: with a controlled clock the text comes back at T+3h−1s and the uniform 404 comes back at T+3h, and a paste read repeatedly before its deadline still dies at T+3h. [item 4]
+- [ ] 9. Reclamation: a sweeper task in the lifespan calling `store.delete_expired(clock.now())` every `SWEEP_INTERVAL_SECONDS`, plus deletion of an expired row on read; test that rows and text bytes return to their pre-paste level once the clock passes the deadlines. [item 6]
+- [ ] 10. Repeated submissions: the same text posted twice yields two ids, both resolve to it, and each 404s on its own deadline. [item 9]
+- [ ] 11. End-to-end test: POST through the test client, open the returned url and see the text byte-for-byte, advance the clock, then check the expired id, a made-up id and a malformed id return the same status, body and headers. [items 1–5; Success: end-to-end create → link → read → expired 404]
+- [ ] 12. Restart test: build the app twice against one database file, assert a paste still inside its three hours resolves and one that reached its deadline during the downtime gives the uniform 404. [item 8]
+- [ ] 13. Wire the run path: `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000` starts clean, the ARCHITECTURE.md verify block passes, the README commands match, and a 1 MiB paste answers in under 200 ms on this machine. [Success: one-command start, manual end-to-end check, latency default]

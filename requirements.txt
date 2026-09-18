@@ -1,0 +1,4 @@
+# Runtime dependencies (ARCHITECTURE.md Stack): the HTTP API and the ASGI
+# server that runs it as one process.
+fastapi
+uvicorn

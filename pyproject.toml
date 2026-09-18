@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pastebin"
+version = "0.0.0"
+description = "A small HTTP service that turns a chunk of text into a link."
+requires-python = ">=3.11"
+# Runtime dependencies are installed from requirements.txt / requirements-dev.txt,
+# as ARCHITECTURE.md Verification says. This metadata exists only so the src/
+# layout can be installed, which is what makes `app` importable as a top-level
+# package from the repository root for `python -m uvicorn app.main:app`.
+dependencies = []
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+# src/ on sys.path, so `pytest` and `python -m pytest` both find the app package
+# from the repository root without relying on the install (ARCHITECTURE.md
+# Verification).
+pythonpath = ["src"]
+testpaths = ["tests"]

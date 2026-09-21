@@ -28,6 +28,20 @@ verbatim round trip PRD.md item 2 asks for; from the deadline on the row is
 deleted before the answer is written — expired text is removed rather than
 filtered (PRD.md item 6) — and the request answers with the 404 below.
 
+**Health.** ``GET /health`` is the readiness probe: 200 and the fixed body
+``{"status": "ok"}``, and nothing else. It is what the documented start path
+answers as soon as the process is up (TASKS.md item 1) and what
+ARCHITECTURE.md's Verification block polls before it checks the paste routes,
+so it is deliberately the smallest thing a monitor can ask for: it takes no
+dependency at all — not the store, not the clock — which is why the same
+answer comes back before a paste exists, while one is stored and long after
+every deadline has passed, and why polling it neither reads nor writes what
+PRD.md item 6 has to reclaim. It is unauthenticated like every other route
+here (ARCHITECTURE.md Sign-in). PRD.md asks for no health check of its own:
+this route is the one thing beyond the paste journey, and it stays a constant
+rather than a report on pastes, deadlines or the sweep, which the PRD keeps
+out of scope.
+
 **Sweep.** ``_sweep_expired_pastes`` is the one background task the process
 runs: every ``config.SWEEP_INTERVAL_SECONDS`` it hands the current instant from
 ``clock.now()`` to ``store.delete_expired`` (ARCHITECTURE.md Sweep, TASKS.md
@@ -91,11 +105,16 @@ from app.store import Store
 # and no caller to tell, so the log is the only place its trouble can surface.
 logger = logging.getLogger(__name__)
 
-# The two paths this module serves, in one place so the link the create
-# response returns is the path the read route answers on (ARCHITECTURE.md
-# Routes: `POST /pastes`, `GET /pastes/{paste_id}`).
+# The paths this module serves, in one place so the link the create response
+# returns is the path the read route answers on (ARCHITECTURE.md Routes:
+# `POST /pastes`, `GET /pastes/{paste_id}`, `GET /health`).
 PASTES_PATH = "/pastes"
 PASTE_PATH = "/pastes/{paste_id}"
+
+# The readiness probe: the path the documented start command answers as soon as
+# the process is up, and the one ARCHITECTURE.md's Verification block polls
+# before it checks the paste routes (TASKS.md item 1).
+HEALTH_PATH = "/health"
 
 # The status and the code every 404 in the app carries (ARCHITECTURE.md Error
 # contract: `404 not_found`). One pair of constants for the read route's
@@ -186,8 +205,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Pastebin", lifespan=lifespan)
 
 
-@app.get("/health")
+@app.get(HEALTH_PATH)
 def health() -> dict[str, str]:
+    """Answer ``200`` with ``{"status": "ok"}``, whatever the service holds.
+
+    The readiness probe of ARCHITECTURE.md's Verification block, and the route
+    TASKS.md item 1 ships with the skeleton: the body is a constant, so a
+    monitor compares one value rather than interpreting a report, and it is
+    served without a credential like every other route here (ARCHITECTURE.md
+    Sign-in).
+
+    It is a plain function with no parameters because it takes no dependency:
+    it does not read ``clock.now()`` and it does not touch ``app.state.store``,
+    so the answer cannot vary with the instant of the request, with whether a
+    paste is stored, or with how much text is waiting to be reclaimed — a poll
+    leaves the rows and the text bytes PRD.md item 6 measures exactly where
+    they were.
+    """
     return {"status": "ok"}
 
 

@@ -2,25 +2,27 @@
 
 Item 5 ships the paste table: opening a store creates the ``pastes`` table and
 the ``expires_at`` index, and the module offers ``insert``, ``get``,
-``delete``, ``delete_expired``, ``count`` and ``text_bytes`` over one
-connection in WAL mode, exercised against a temporary file including reopening
-it (item 8's restart, item 6's reclamation).
+``consume``, ``delete``, ``delete_expired``, ``count`` and ``text_bytes`` over
+one connection in WAL mode, exercised against a temporary file including
+reopening it (item 8's restart, item 6's reclamation).
 
 These cases pin what the later tasks are allowed to rely on:
 
-- opening the file is startup: exactly one table with the four documented
+- opening the file is startup: exactly one table with the five documented
   columns and their declared types, exactly one index over ``expires_at``, a
   plain non-unique index because two pastes created at the same instant share
   a deadline (item 9);
-- one connection, in WAL mode, serves every operation;
-- ``get`` returns each row's own text and both stored instants, and a
-  near-miss id is a miss rather than another paste's text (item 3);
+- one connection, in WAL mode, serves every operation, including the
+  burn-after-read lookup ``consume``;
+- ``get`` returns each row's own text, both stored instants and the stored
+  burn-after-read flag, and a near-miss id is a miss rather than another
+  paste's text (item 3);
 - text goes in as data and comes back verbatim (item 2), the same text twice
   is two pastes (item 9), and the schema refuses a row without its NOT NULL
   values;
 - an insert is committed as it happens, so the row is in the file for a
   process that never closed the store (item 8), and a store opened on that
-  file hands back the stored deadline;
+  file hands back the stored deadline and flag;
 - ``delete`` reports the row it removed and does nothing on a repeat;
 - ``delete_expired`` is inclusive at a fractional instant — gone at its
   deadline, kept one instant before it (item 4's boundary) — and rows and
@@ -31,10 +33,11 @@ These cases pin what the later tasks are allowed to rely on:
 
 They complement ``tests/test_store.py`` (same task), which covers the raw
 schema pragmas, the WAL flag on the file, a verbatim round-trip of newlines,
-whitespace, non-ASCII and emoji, the unknown and malformed id misses, the
-duplicate-id refusal, delete and sweep arithmetic, the byte-versus-character
-measurement at the 1 MiB ceiling, 1000 round-trips under ``ids.new_id()``,
-cross-process writes and eight threads at once.
+whitespace, non-ASCII and emoji, the burn-after-read flag and ``consume``, the
+unknown and malformed id misses, the duplicate-id refusal, delete and sweep
+arithmetic, the byte-versus-character measurement at the 1 MiB ceiling, 1000
+round-trips under ``ids.new_id()``, cross-process writes and eight threads at
+once.
 
 Cases that need a route, a clock or the lifespan — the read path's
 compare-delete-then-404, the create route's insert, the sweeper loop and the
@@ -61,15 +64,19 @@ CREATED_AT = 1_700_000_000.0
 THREE_HOURS_IN_SECONDS = 3 * 60 * 60
 DEADLINE = CREATED_AT + THREE_HOURS_IN_SECONDS
 
-# ARCHITECTURE.md Data's four columns, as `(name, declared type, not-null,
-# primary key)`. SQLite does not report a `TEXT PRIMARY KEY` as NOT NULL — the
-# primary-key flag is what makes the id the key — so `id` has not-null 0 and
-# the three columns the schema declares NOT NULL have 1.
+# ARCHITECTURE.md Data's columns, as `(name, declared type, not-null,
+# primary key)`, plus the burn-after-read flag. SQLite does not report a
+# `TEXT PRIMARY KEY` as NOT NULL — the primary-key flag is what makes the id
+# the key — so `id` has not-null 0 and the four columns the schema declares
+# NOT NULL have 1. ``burn_after_read`` is an INTEGER boolean, the column name
+# for the opt-in flag a creator sets when they want the first read to consume
+# the paste.
 DOCUMENTED_COLUMNS = [
     ("id", "TEXT", 0, 1),
     ("text", "TEXT", 1, 0),
     ("created_at", "REAL", 1, 0),
     ("expires_at", "REAL", 1, 0),
+    ("burn_after_read", "INTEGER", 1, 0),
 ]
 
 # The one index, and the one table, ARCHITECTURE.md Data declares.
@@ -77,10 +84,12 @@ DOCUMENTED_INDEX = "pastes_expires_at"
 DOCUMENTED_TABLE = "pastes"
 
 # The operations TASKS.md item 5 names, plus the lifecycle the lifespan needs
-# (``close``) and the path the store was opened on.
+# (``close``), the path the store was opened on, and the burn-after-read
+# lookup the read route uses (``consume``).
 DOCUMENTED_PUBLIC_SURFACE = {
     "insert",
     "get",
+    "consume",
     "delete",
     "delete_expired",
     "count",
@@ -234,6 +243,7 @@ def test_tc003_every_operation_uses_the_one_connection_and_it_is_in_wal_mode(
         opened.insert(PASTE_ID, "text", CREATED_AT, DEADLINE)
         opened.get(PASTE_ID)
         opened.get(OTHER_ID)
+        opened.consume(PASTE_ID)
         opened.delete(OTHER_ID)
         opened.delete_expired(DEADLINE - THREE_HOURS_IN_SECONDS)
         opened.count()
@@ -245,7 +255,7 @@ def test_tc003_every_operation_uses_the_one_connection_and_it_is_in_wal_mode(
 
 
 def test_tc004_get_returns_each_pastes_own_text_and_instants(opened_store: Store) -> None:
-    """The read path's lookup: one row's text and deadline per id (item 5, item 8)."""
+    """The read path's lookup: one row's text, instants and flag per id (item 5, item 8)."""
     first_text = "first\npaste\n"
     second_created = CREATED_AT + 1.5
     third_created = CREATED_AT + 60.0
@@ -263,6 +273,7 @@ def test_tc004_get_returns_each_pastes_own_text_and_instants(opened_store: Store
         third_text,
         third_created,
         third_created + THREE_HOURS_IN_SECONDS,
+        True,
     )
 
     first = opened_store.get(PASTE_ID)
@@ -282,17 +293,20 @@ def test_tc004_get_returns_each_pastes_own_text_and_instants(opened_store: Store
         CREATED_AT,
         DEADLINE,
     )
+    assert first.burn_after_read is False
     assert second == Paste(
         id=OTHER_ID,
         text="second paste",
         created_at=second_created,
         expires_at=second_created + THREE_HOURS_IN_SECONDS,
     )
+    assert second.burn_after_read is False
     assert third == Paste(
         id=THIRD_ID,
         text=third_text,
         created_at=third_created,
         expires_at=third_created + THREE_HOURS_IN_SECONDS,
+        burn_after_read=True,
     )
 
 
@@ -342,13 +356,14 @@ def test_tc007_an_insert_is_committed_for_an_independent_reader(
     connection = _plain_connection(db_path)
     try:
         rows = connection.execute(
-            "SELECT id, text, created_at, expires_at FROM pastes WHERE id = ?",
+            "SELECT id, text, created_at, expires_at, burn_after_read "
+            "FROM pastes WHERE id = ?",
             (PASTE_ID,),
         ).fetchall()
     finally:
         connection.close()
 
-    assert rows == [(PASTE_ID, "committed at once", CREATED_AT, DEADLINE)]
+    assert rows == [(PASTE_ID, "committed at once", CREATED_AT, DEADLINE, 0)]
 
 
 def test_tc008_a_second_store_sees_the_paste_while_the_first_stays_open(
@@ -381,7 +396,7 @@ def test_tc008_a_second_store_sees_the_paste_while_the_first_stays_open(
 def test_tc009_the_schema_refuses_a_row_without_its_not_null_values(
     opened_store: Store,
 ) -> None:
-    """ARCHITECTURE.md Data declares text, created_at and expires_at NOT NULL."""
+    """ARCHITECTURE.md Data declares text, created_at, expires_at and flag NOT NULL."""
     with pytest.raises(sqlite3.IntegrityError):
         opened_store.insert(PASTE_ID, None, CREATED_AT, DEADLINE)  # type: ignore[arg-type]
 
@@ -390,6 +405,11 @@ def test_tc009_the_schema_refuses_a_row_without_its_not_null_values(
 
     with pytest.raises(sqlite3.IntegrityError):
         opened_store.insert(PASTE_ID, "text", CREATED_AT, None)  # type: ignore[arg-type]
+
+    with pytest.raises(sqlite3.IntegrityError):
+        opened_store.insert(
+            PASTE_ID, "text", CREATED_AT, DEADLINE, None  # type: ignore[arg-type]
+        )
 
     assert opened_store.get(PASTE_ID) is None
     assert opened_store.count() == 0
@@ -504,6 +524,7 @@ def test_tc015_close_closes_the_one_connection_and_frees_the_file(db_path: Path)
     operations = [
         lambda: opened.insert(OTHER_ID, "text", CREATED_AT, DEADLINE),
         lambda: opened.get(PASTE_ID),
+        lambda: opened.consume(PASTE_ID),
         lambda: opened.delete(PASTE_ID),
         lambda: opened.delete_expired(DEADLINE),
         lambda: opened.count(),
@@ -527,5 +548,13 @@ def test_tc016_the_store_ships_the_documented_operations_and_nothing_to_list_pas
     public_surface = {name for name in vars(Store) if not name.startswith("_")}
 
     assert public_surface == DOCUMENTED_PUBLIC_SURFACE
-    for name in ("insert", "get", "delete", "delete_expired", "count", "text_bytes"):
+    for name in (
+        "insert",
+        "get",
+        "consume",
+        "delete",
+        "delete_expired",
+        "count",
+        "text_bytes",
+    ):
         assert callable(getattr(Store, name)), name

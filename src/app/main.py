@@ -13,20 +13,26 @@ its content type (ARCHITECTURE.md Create and its decision row "Create body is
 raw text"): the body is read with the 1 MiB ceiling applied, so a request that
 declares or streams more than ``config.MAX_PASTE_BYTES`` answers 413 without
 the text being stored, and an empty body or one that is not valid UTF-8
-answers 400 the same way (PRD.md item 7). Only then is an id drawn from
+answers 400 the same way (PRD.md item 7). The opt-in
+``?burn_after_read=true`` query flag marks the paste for deletion on its first
+successful read; it defaults to false, so a paste never burns just because a
+link previewer or crawler opened it first. Only then is an id drawn from
 ``ids.new_id()``, the instant taken from the injected ``clock.now()``, the
 deadline computed once from ``config.PASTE_TTL_SECONDS`` and the row handed to
 the store (ARCHITECTURE.md Create). The answer is 201 with the id, the
 absolute link built from this request and the deadline as an instant, which
 is the response shape PRD.md's applied defaults fix.
 
-**Read.** ``GET /pastes/{paste_id}`` looks the row up by its id and compares
-the stored deadline with the injected instant (ARCHITECTURE.md Read). Strictly
-before the deadline the answer is 200 with ``Content-Type: text/plain;
-charset=utf-8`` and the stored text as the body, unchanged, which is the
-verbatim round trip PRD.md item 2 asks for; from the deadline on the row is
-deleted before the answer is written — expired text is removed rather than
-filtered (PRD.md item 6) — and the request answers with the 404 below.
+**Read.** ``GET /pastes/{paste_id}`` looks the row up by its id through
+``Store.consume`` and compares the stored deadline with the injected instant
+(ARCHITECTURE.md Read). Strictly before the deadline the answer is 200 with
+``Content-Type: text/plain; charset=utf-8`` and the stored text as the body,
+unchanged, which is the verbatim round trip PRD.md item 2 asks for. If the
+paste was created with the burn-after-read flag, the consume deleted the row
+before that answer is written, so the first successful read is the only one
+that can serve the text. From the deadline on the row is deleted before the
+answer is written — expired text is removed rather than filtered (PRD.md item
+6) — and the request answers with the 404 below.
 
 **Sweep.** ``_sweep_expired_pastes`` is the one background task the process
 runs: every ``config.SWEEP_INTERVAL_SECONDS`` it hands the current instant from
@@ -290,7 +296,11 @@ def _iso8601_utc(instant: float) -> str:
 
 
 @app.post(PASTES_PATH, status_code=201)
-async def create_paste(request: Request, now: clock.Now) -> JSONResponse:
+async def create_paste(
+    request: Request,
+    now: clock.Now,
+    burn_after_read: bool = False,
+) -> JSONResponse:
     """Store the posted text and answer 201 with its id, link and deadline.
 
     The order is the requirement: the ceiling, then the empty and encoding
@@ -299,6 +309,14 @@ async def create_paste(request: Request, now: clock.Now) -> JSONResponse:
     is that instant plus the fixed lifetime, computed here once and stored, so
     a restart or a clock change cannot move a deadline (PRD.md item 4,
     ARCHITECTURE.md Data).
+
+    ``burn_after_read`` is the explicit opt-in flag for a paste whose first
+    successful GET deletes it. It is a query parameter, not a default: the
+    route answers 201 for a plain ``POST /pastes`` exactly as before, and only
+    a request that asks — ``POST /pastes?burn_after_read=true`` — stores the
+    flag. That opt-in matters because a link previewer or crawler can issue the
+    first GET; the creator, not the first opener, decides whether the paste is
+    consumed by that open.
     """
     declared = _declared_content_length(request)
     if declared is not None and declared > config.MAX_PASTE_BYTES:
@@ -323,7 +341,14 @@ async def create_paste(request: Request, now: clock.Now) -> JSONResponse:
 
     # The store's one connection is synchronous: it is used off the event loop
     # so a write cannot stall the requests served while it commits.
-    await run_in_threadpool(store.insert, paste_id, text, created_at, expires_at)
+    await run_in_threadpool(
+        store.insert,
+        paste_id,
+        text,
+        created_at,
+        expires_at,
+        burn_after_read,
+    )
 
     return JSONResponse(
         status_code=201,
@@ -339,8 +364,15 @@ async def create_paste(request: Request, now: clock.Now) -> JSONResponse:
 def read_paste(paste_id: str, request: Request, now: clock.Now) -> Response:
     """Answer the stored text, or the uniform 404 from the deadline on.
 
-    The lookup hands back the row with the deadline it was created with, and
-    the injected instant decides the boundary: while ``now`` is strictly before
+    The lookup is ``Store.consume``: it hands back the row with the deadline it
+    was created with, and for a paste whose creator opted into burn-after-read
+    it deletes the row in the same lock before this route can answer 200. That
+    makes the first successful read the only one that receives the text; a
+    racing or later reader gets ``None`` and the same 404 as an id that was
+    never issued. An ordinary paste is returned without a write, exactly as a
+    plain lookup.
+
+    The injected instant decides the boundary: while ``now`` is strictly before
     ``expires_at`` the answer is 200 with ``text/plain; charset=utf-8`` and the
     stored text as the body, unchanged (PRD.md items 2 and 4). From the
     deadline on the row is deleted before the request answers, so expired text
@@ -356,11 +388,12 @@ def read_paste(paste_id: str, request: Request, now: clock.Now) -> Response:
     the single handler above, together with the router's unmatched paths.
     """
     store: Store = request.app.state.store
-    paste = store.get(paste_id)
+    paste = store.consume(paste_id)
 
     if paste is None:
-        # Never issued, or issued and already deleted — by this route earlier,
-        # or by the sweeper: the same uniform 404 either way (PRD.md item 5).
+        # Never issued, or issued and already consumed or deleted — by an
+        # earlier burn-after-read, by this route, or by the sweeper: the same
+        # uniform 404 either way (PRD.md item 5).
         raise StarletteHTTPException(
             status_code=NOT_FOUND_STATUS, detail=NOT_FOUND_CODE
         )
@@ -368,9 +401,13 @@ def read_paste(paste_id: str, request: Request, now: clock.Now) -> Response:
     if now >= paste.expires_at:
         # Deleted first, then the 404: the expired text is gone rather than
         # hidden (PRD.md item 6), and the row has already left the table by the
-        # time the answer is written. Deleting by id cannot disturb another
-        # paste, and an id the sweeper has already collected deletes nothing.
-        store.delete(paste_id)
+        # time the answer is written. A burn-after-read row that reached its
+        # deadline before being read was already deleted by ``consume``; an
+        # ordinary expired row is deleted here. Deleting by id cannot disturb
+        # another paste, and an id the sweeper has already collected deletes
+        # nothing.
+        if not paste.burn_after_read:
+            store.delete(paste_id)
         raise StarletteHTTPException(
             status_code=NOT_FOUND_STATUS, detail=NOT_FOUND_CODE
         )

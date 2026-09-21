@@ -2,38 +2,48 @@
 
 TASKS.md item 5 ships this module with the ``pastes`` table and the
 ``expires_at`` index created when the store is opened, the operations the
-routes and the sweeper call — ``insert``, ``get``, ``delete``,
+routes and the sweeper call — ``insert``, ``get``, ``consume``, ``delete``,
 ``delete_expired``, ``count`` and ``text_bytes`` — and one connection in WAL
 mode for the whole process (ARCHITECTURE.md Parts, table row "Store", and its
 decision row "Synchronous ``sqlite3``, one connection in WAL mode, access
 serialised in the app").
 
-The schema is ARCHITECTURE.md Data's, character for character: ``created_at``
-and ``expires_at`` are Unix seconds as floats and ``expires_at`` is computed
-once at creation and stored as an instant, so reopening the same file hands
-every paste back with the deadline it was given and neither a restart nor a
-clock change can move one (PRD.md item 4, item 8). ``text`` is stored
-verbatim — no trimming, normalisation or deduplication (PRD.md item 2, item 9)
-— and the row is deleted rather than filtered once its deadline passes, which
-is what makes the reclamation in PRD.md item 6 measurable as rows and text
-bytes through ``count`` and ``text_bytes``.
+The schema is ARCHITECTURE.md Data's, with one later addition: ``created_at``
+and ``expires_at`` are Unix seconds as floats, ``expires_at`` is computed once
+at creation and stored as an instant, and ``burn_after_read`` is the opt-in
+flag for a paste whose first successful read consumes it. So reopening the
+same file hands every paste back with the deadline it was given and the flag
+it was created with, and neither a restart nor a clock change can move one
+(PRD.md item 4, item 8). ``text`` is stored verbatim — no trimming,
+normalisation or deduplication (PRD.md item 2, item 9) — and a row is deleted
+rather than filtered once its deadline passes or, for a burn-after-read paste,
+once its first successful read consumes it. Reclamation in PRD.md item 6 is
+measured as rows and text bytes through ``count`` and ``text_bytes``.
+
+The schema also migrates an existing database file from before the
+burn-after-read column existed: after the table is created, the store adds the
+column if it is missing, so upgrading the process does not discard or fail on
+pastes the earlier version stored.
 
 Where the parts in ARCHITECTURE.md fit:
 
-- ``insert`` is what the create route calls with ``(id, text, now, now + 3h)``
-  (ARCHITECTURE.md Create); ``get`` and ``delete`` are the read path's lookup
-  and its removal of an expired row (ARCHITECTURE.md Read); ``delete_expired``
-  is the sweeper's one statement (ARCHITECTURE.md Sweep), called with
-  ``clock.now()`` so the store never reads a clock of its own (AGENTS.md
-  Conventions); ``count`` and ``text_bytes`` measure what is stored, for the
-  reclamation check in TASKS.md item 9.
+- ``insert`` is what the create route calls with ``(id, text, now, now + 3h,
+  burn_after_read)`` (ARCHITECTURE.md Create); ``consume`` is the read path's
+  lookup — it returns the row and, for a burn-after-read paste, deletes it in
+  the same lock so two racing readers cannot both receive the text; ``get``
+  and ``delete`` are the read path's plain lookup and its removal of an
+  expired row (ARCHITECTURE.md Read); ``delete_expired`` is the sweeper's one
+  statement (ARCHITECTURE.md Sweep), called with ``clock.now()`` so the store
+  never reads a clock of its own (AGENTS.md Conventions); ``count`` and
+  ``text_bytes`` measure what is stored, for the reclamation check in
+  TASKS.md item 9.
 - Opening a store is startup work: the constructor creates the file if it is
-  missing, switches it to WAL and creates the table and the index if they are
-  missing, which is why the lifespan opens the store once and closes it on
-  shutdown (TASKS.md items 5 and 9). Nothing here touches the clock, the
-  configuration or the request: the path is handed in, so the test suite can
-  point the store at a throwaway file and never reach the operator's database
-  (PRD.md Success).
+  missing, switches it to WAL, creates the table and the index if they are
+  missing, and migrates the burn-after-read column if it is missing. The
+  lifespan opens the store once and closes it on shutdown (TASKS.md items 5
+  and 9). Nothing here touches the clock, the configuration or the request:
+  the path is handed in, so the test suite can point the store at a throwaway
+  file and never reach the operator's database (PRD.md Success).
 - The one connection is used from more than one thread once the app runs:
   every call into the store goes through FastAPI's threadpool — a synchronous
   route is served there, and the create route, which reads its request body
@@ -51,33 +61,52 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-# ARCHITECTURE.md Data: one table, no others, and the single index over the
-# deadline the sweeper's range scan uses. Both statements are idempotent, so
-# reopening an existing file is a no-op that leaves its rows untouched
-# (PRD.md item 8).
+# ARCHITECTURE.md Data, plus the burn-after-read flag: one table, no others,
+# and the single index over the deadline the sweeper's range scan uses. Both
+# statements are idempotent, so reopening an existing file is a no-op that
+# leaves its rows untouched (PRD.md item 8). The flag is stored as an INTEGER
+# with a default of 0, the SQLite spelling of a boolean column: a paste is
+# burn-after-read only when its creator asked for it.
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS pastes (
-  id         TEXT PRIMARY KEY,
-  text       TEXT NOT NULL,
-  created_at REAL NOT NULL,
-  expires_at REAL NOT NULL
+  id               TEXT PRIMARY KEY,
+  text             TEXT NOT NULL,
+  created_at       REAL NOT NULL,
+  expires_at       REAL NOT NULL,
+  burn_after_read  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS pastes_expires_at ON pastes (expires_at);
 """
 
-# The deadline is stored, never recomputed: the value the create route passes
-# goes in as it is (ARCHITECTURE.md Decision "``expires_at`` stored as an
+# The migration for a database file created before the burn-after-read column
+# existed. ``ALTER TABLE ... ADD COLUMN`` keeps every existing row, and the
+# NOT NULL default gives each of them the safe value: old pastes were never
+# burn-after-read, so they remain ordinary pastes.
+_ADD_BURN_AFTER_READ_COLUMN_SQL = """
+ALTER TABLE pastes ADD COLUMN burn_after_read INTEGER NOT NULL DEFAULT 0
+"""
+
+# The deadline is stored, never recomputed: the values the create route passes
+# go in as they are (ARCHITECTURE.md Decision "``expires_at`` stored as an
 # absolute instant").
 _INSERT_SQL = """
-INSERT INTO pastes (id, text, created_at, expires_at) VALUES (?, ?, ?, ?)
+INSERT INTO pastes (id, text, created_at, expires_at, burn_after_read)
+VALUES (?, ?, ?, ?, ?)
 """
 
 _SELECT_SQL = """
-SELECT id, text, created_at, expires_at FROM pastes WHERE id = ?
+SELECT id, text, created_at, expires_at, burn_after_read FROM pastes WHERE id = ?
 """
 
 _DELETE_SQL = """
 DELETE FROM pastes WHERE id = ?
+"""
+
+# The conditional delete behind ``consume``: only a row the creator marked
+# burn-after-read is removed by a read, and the flag cannot change after
+# creation, so the ``AND`` is a guard rather than a decision that could race.
+_DELETE_BURN_AFTER_READ_SQL = """
+DELETE FROM pastes WHERE id = ? AND burn_after_read = 1
 """
 
 # `<=`, not `<`: PRD.md's boundary default makes a paste unretrievable from its
@@ -99,21 +128,40 @@ SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) FROM pastes
 """
 
 
+def _ensure_burn_after_read_column(connection: sqlite3.Connection) -> None:
+    """Add the burn-after-read column to an older table, if it is missing.
+
+    A database file created by the version without the flag has a ``pastes``
+    table with only the four original columns. ``CREATE TABLE IF NOT EXISTS``
+    leaves that table alone, so this is the upgrade path: the column is added
+    once, with ``0`` for every existing row. A newly created table already has
+    the column, and this becomes a no-op.
+    """
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(pastes)").fetchall()
+    }
+    if "burn_after_read" not in columns:
+        connection.execute(_ADD_BURN_AFTER_READ_COLUMN_SQL)
+
+
 @dataclass(frozen=True, slots=True)
 class Paste:
-    """One stored paste, as ``get`` returns it.
+    """One stored paste, as ``get`` and ``consume`` return it.
 
     ``expires_at`` is the deadline fixed at creation (PRD.md item 4), which the
     read path compares against ``clock.now()``; ``text`` is the stored text
     unchanged, which the read path serves as the response body (PRD.md item 2).
     ``created_at`` is carried along because both instants are part of the row
-    (ARCHITECTURE.md Data).
+    (ARCHITECTURE.md Data). ``burn_after_read`` is the stored opt-in flag: when
+    it is true, the first successful read deletes the row, so the paste can be
+    served at most once.
     """
 
     id: str
     text: str
     created_at: float
     expires_at: float
+    burn_after_read: bool = False
 
 
 class Store:
@@ -121,9 +169,10 @@ class Store:
 
     Constructing a ``Store`` is opening the database: the file (and its
     directory's WAL sidecars) is created if missing, ``journal_mode`` is set to
-    WAL, and the table and index are created if they are missing. The lifespan
-    does this once at startup and calls ``close()`` at shutdown (TASKS.md item
-    9), while tests open and close throwaway files (PRD.md Success).
+    WAL, the table and index are created if they are missing, and an older
+    table is migrated to carry the burn-after-read column. The lifespan does
+    this once at startup and calls ``close()`` at shutdown (TASKS.md item 9),
+    while tests open and close throwaway files (PRD.md Success).
 
     Every method is safe to call from any thread, and all of them use the one
     connection: the lock serialises them, which is what makes a single
@@ -144,6 +193,8 @@ class Store:
             # being told (ARCHITECTURE.md Stack: "one connection in WAL mode").
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(_SCHEMA_SQL)
+            _ensure_burn_after_read_column(connection)
+            connection.commit()
         except BaseException:
             # A file that could not be prepared is not left open behind a
             # failed startup.
@@ -168,19 +219,28 @@ class Store:
             self._connection.close()
 
     def insert(
-        self, paste_id: str, text: str, created_at: float, expires_at: float
+        self,
+        paste_id: str,
+        text: str,
+        created_at: float,
+        expires_at: float,
+        burn_after_read: bool = False,
     ) -> None:
         """Store one paste under ``paste_id`` and commit it.
 
         The text is written verbatim and both instants are written as given, so
         the deadline stored here is the one every later read enforces (PRD.md
-        items 2 and 4). A second insert under an id that is already stored
-        raises ``sqlite3.IntegrityError``: the primary key refuses it rather
-        than replacing the paste that is there.
+        items 2 and 4). ``burn_after_read`` is stored as the opt-in flag the
+        read path later honours; the default is false, because a paste must
+        never burn on the first read unless its creator asked for it. A second
+        insert under an id that is already stored raises
+        ``sqlite3.IntegrityError``: the primary key refuses it rather than
+        replacing the paste that is there.
         """
         with self._lock:
             self._connection.execute(
-                _INSERT_SQL, (paste_id, text, created_at, expires_at)
+                _INSERT_SQL,
+                (paste_id, text, created_at, expires_at, burn_after_read),
             )
             self._connection.commit()
 
@@ -190,7 +250,9 @@ class Store:
         No deadline is applied here: the read path compares the returned
         ``expires_at`` against ``clock.now()`` itself, so the store holds no
         clock and an expired row is deleted by the caller before it answers the
-        uniform 404 (ARCHITECTURE.md Read).
+        uniform 404 (ARCHITECTURE.md Read). ``consume`` is the read path's
+        lookup; ``get`` remains the plain, side-effect-free read for callers
+        that must inspect a row without consuming it.
         """
         with self._lock:
             row = self._connection.execute(_SELECT_SQL, (paste_id,)).fetchone()
@@ -198,8 +260,45 @@ class Store:
         if row is None:
             return None
         return Paste(
-            id=row[0], text=row[1], created_at=row[2], expires_at=row[3]
+            id=row[0],
+            text=row[1],
+            created_at=row[2],
+            expires_at=row[3],
+            burn_after_read=bool(row[4]),
         )
+
+    def consume(self, paste_id: str) -> Paste | None:
+        """Return the paste under ``paste_id``, deleting burn-after-read rows.
+
+        This is the read path's one lookup. For an ordinary paste the row is
+        returned with no write, exactly like ``get``. For a paste whose creator
+        opted into burn-after-read, the row is deleted in the same lock that
+        read it, before the route can answer 200: the first successful reader
+        is the only one that receives the text, and a racing second reader gets
+        ``None`` and the same 404 as an id that was never issued. The deletion
+        happens on the read path, not at creation or by the sweeper, so an
+        unread burn-after-read paste still lives until its deadline and is
+        still collected by ``delete_expired`` once the deadline passes.
+        """
+        with self._lock:
+            row = self._connection.execute(_SELECT_SQL, (paste_id,)).fetchone()
+
+            if row is None:
+                return None
+
+            paste = Paste(
+                id=row[0],
+                text=row[1],
+                created_at=row[2],
+                expires_at=row[3],
+                burn_after_read=bool(row[4]),
+            )
+
+            if paste.burn_after_read:
+                self._connection.execute(_DELETE_BURN_AFTER_READ_SQL, (paste_id,))
+                self._connection.commit()
+
+            return paste
 
     def delete(self, paste_id: str) -> int:
         """Delete the paste stored under ``paste_id``; return how many rows went.

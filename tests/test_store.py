@@ -2,32 +2,36 @@
 (TASKS.md item 5).
 
 The module ships the ``pastes`` table and the ``expires_at`` index created at
-startup, with ``insert``, ``get``, ``delete``, ``delete_expired``, ``count``
-and ``text_bytes`` over one connection, and the task names its criterion: the
-store is exercised against a temporary file, including reopening it. That
-reopening is PRD.md item 8 — an unexpired paste is still there after the
-service is rebuilt on the same file, with the deadline it was created with —
-and the two measurements, rows (``count``) and text bytes (``text_bytes``),
-are what PRD.md item 6's reclamation is checked against (TASKS.md item 9).
+startup, with ``insert``, ``get``, ``consume``, ``delete``, ``delete_expired``,
+``count`` and ``text_bytes`` over one connection, and the task names its
+criterion: the store is exercised against a temporary file, including
+reopening it. That reopening is PRD.md item 8 — an unexpired paste is still
+there after the service is rebuilt on the same file, with the deadline it was
+created with — and the two measurements, rows (``count``) and text bytes
+(``text_bytes``), are what PRD.md item 6's reclamation is checked against
+(TASKS.md item 9).
 
 Every case below therefore runs against a throwaway file under ``tmp_path``
 and never touches the operator's database (PRD.md Success, AGENTS.md
 Conventions). What they pin:
 
 - the file is created where it was asked for, holding the ``pastes`` table
-  with the four documented columns and the one index over ``expires_at``, and
+  with the five documented columns and the one index over ``expires_at``, and
   the connection reports WAL;
 - exactly one connection is opened and reused by every operation, and the
   store is usable from several threads at once;
-- a paste round-trips verbatim with both instants unchanged, and an unknown id
-  returns ``None`` rather than raising;
+- a paste round-trips verbatim with both instants and the burn-after-read flag
+  unchanged, and an unknown id returns ``None`` rather than raising;
+- ``consume`` returns a paste and deletes it only when its creator opted into
+  burn-after-read, so the first successful read is the only one;
 - ``delete`` removes one row and reports it, leaving other pastes alone;
 - ``delete_expired`` removes rows at or past their deadline and nothing else,
   the boundary PRD.md's defaults fix;
 - ``count`` and ``text_bytes`` measure rows and stored UTF-8 bytes, and both
   return to their earlier values once expired rows are swept;
-- reopening the same file gives the pastes back with their stored deadlines,
-  and a store opened on an existing file adds nothing and loses nothing.
+- reopening the same file gives the pastes back with their stored deadlines
+  and flags, and a store opened on an existing file adds nothing and loses
+  nothing.
 
 Cases that need a clock, a route or the sweeper — the read path's
 "compare, delete, then 404", the create route's insert, and the loop that
@@ -60,12 +64,15 @@ DEADLINE = CREATED_AT + THREE_HOURS_IN_SECONDS
 # `(name, declared type, not-null flag, primary-key flag)`. SQLite does not
 # treat a `TEXT PRIMARY KEY` as implicitly NOT NULL — the primary-key flag is
 # what makes `id` the key — so the pragma reports not-null 0 for it and 1 for
-# the three columns the schema declares NOT NULL.
+# the four columns the schema declares NOT NULL. ``burn_after_read`` is the
+# burn-after-read flag: an INTEGER boolean whose default is 0, so a paste is
+# consumed by a read only when its creator asked for it.
 DOCUMENTED_COLUMNS = [
     ("id", "TEXT", 0, 1),
     ("text", "TEXT", 1, 0),
     ("created_at", "REAL", 1, 0),
     ("expires_at", "REAL", 1, 0),
+    ("burn_after_read", "INTEGER", 1, 0),
 ]
 
 # The index the sweeper's range scan relies on (ARCHITECTURE.md Data).
@@ -194,7 +201,7 @@ def test_opening_the_store_creates_the_database_file_where_it_was_asked_for(
 def test_opening_the_store_creates_the_pastes_table_with_the_documented_columns(
     opened_store: Store, db_path: Path
 ) -> None:
-    """ARCHITECTURE.md Data's four columns: id, text, created_at, expires_at."""
+    """ARCHITECTURE.md Data's columns: id, text, created_at, expires_at, flag."""
     assert "pastes" in _object_names(db_path)
     assert _columns(db_path) == DOCUMENTED_COLUMNS
 
@@ -236,6 +243,7 @@ def test_the_store_keeps_one_connection_for_every_operation(
         opened.insert(PASTE_ID, "hello", CREATED_AT, DEADLINE)
         opened.get(PASTE_ID)
         opened.get(UNKNOWN_ID)
+        opened.consume(PASTE_ID)
         opened.count()
         opened.text_bytes()
         opened.delete(UNKNOWN_ID)
@@ -275,6 +283,20 @@ def test_insert_then_get_returns_the_paste_exactly_as_it_was_stored(
     assert opened_store.get(PASTE_ID) == Paste(
         id=PASTE_ID, text=text, created_at=CREATED_AT, expires_at=DEADLINE
     )
+
+
+def test_insert_then_get_returns_the_burn_after_read_flag(
+    opened_store: Store,
+) -> None:
+    """The flag is stored as an integer boolean, not guessed from the text."""
+    opened_store.insert(PASTE_ID, "burn me", CREATED_AT, DEADLINE, True)
+
+    stored = opened_store.get(PASTE_ID)
+
+    assert stored is not None
+    assert stored.burn_after_read is True
+    assert opened_store.count() == 1
+    assert opened_store.text_bytes() == len("burn me".encode("utf-8"))
 
 
 def test_the_stored_instants_are_handed_back_unchanged(opened_store: Store) -> None:
@@ -318,6 +340,48 @@ def test_a_second_insert_under_the_same_id_is_refused(opened_store: Store) -> No
     assert stored is not None
     assert stored.text == "first"
     assert opened_store.count() == 1
+
+
+def test_consume_returns_an_ordinary_paste_without_deleting_it(
+    opened_store: Store,
+) -> None:
+    """A paste not marked burn-after-read is read, not consumed."""
+    opened_store.insert(PASTE_ID, "read me many times", CREATED_AT, DEADLINE)
+
+    first = opened_store.consume(PASTE_ID)
+    second = opened_store.consume(PASTE_ID)
+
+    assert first is not None
+    assert first.text == "read me many times"
+    assert second is not None
+    assert second.text == "read me many times"
+    assert opened_store.get(PASTE_ID) is not None
+    assert opened_store.count() == 1
+
+
+def test_consume_deletes_a_burn_after_read_paste_as_it_returns_it(
+    opened_store: Store,
+) -> None:
+    """The first successful read is the only one: the row leaves with the read."""
+    opened_store.insert(PASTE_ID, "burn me once", CREATED_AT, DEADLINE, True)
+
+    first = opened_store.consume(PASTE_ID)
+
+    assert first is not None
+    assert first.burn_after_read is True
+    assert first.text == "burn me once"
+    assert opened_store.consume(PASTE_ID) is None
+    assert opened_store.get(PASTE_ID) is None
+    assert opened_store.count() == 0
+    assert opened_store.text_bytes() == 0
+
+
+def test_consume_of_an_unknown_id_returns_none(opened_store: Store) -> None:
+    """The read path's lookup turns a miss into the uniform 404."""
+    opened_store.insert(PASTE_ID, "text", CREATED_AT, DEADLINE)
+
+    assert opened_store.consume(OTHER_ID) is None
+    assert opened_store.consume("no-such-id") is None
 
 
 def test_delete_removes_the_row_and_reports_it(opened_store: Store) -> None:
